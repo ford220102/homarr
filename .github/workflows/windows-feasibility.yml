@@ -90,76 +90,155 @@ jobs:
             throw "Forbidden secret-like files found in build outputs"
           }
 
-      - name: Run Windows server smoke test
+      - name: Run Windows server smoke test with Garnet
         shell: pwsh
         run: |
-          $redisServer = Get-Command redis-server -ErrorAction SilentlyContinue
-          if ($redisServer) {
-            Write-Host "Native Redis found: $($redisServer.Source)"
-          } else {
-            Write-Warning "No native Redis server found on the runner. Redis-dependent features are not covered by this smoke test."
-          }
-
           if (-not (Test-Path -LiteralPath "packages/db/migrations/sqlite/migrate.cjs" -PathType Leaf)) {
             throw "Missing SQLite migration bundle: packages/db/migrations/sqlite/migrate.cjs"
           }
 
-          $smokeDatabase = Join-Path $env:RUNNER_TEMP "homarr-smoke.db"
-          Remove-Item -LiteralPath $smokeDatabase -ErrorAction SilentlyContinue
+          $garnetZip = Join-Path $env:RUNNER_TEMP "garnet.zip"
+          $garnetDir = Join-Path $env:RUNNER_TEMP "garnet"
+          $garnetExpectedSha = "41ab3d438c8e1b8d146c33bfb2d010dd514f687d7fd276b97511981839940d00"
+          $garnetUrl = "https://github.com/microsoft/garnet/releases/download/v2.2.8/win-x64-based-readytorun.zip"
+          $garnetExe = Join-Path $garnetDir "net10.0\\GarnetServer.exe"
 
-          $env:NODE_ENV = "production"
-          $env:SKIP_ENV_VALIDATION = "true"
-          $env:DB_DIALECT = "sqlite"
-          $env:DB_DRIVER = "better-sqlite3"
-          $env:DB_URL = $smokeDatabase
-          $env:AUTH_SECRET = (node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")
-          $env:SECRET_ENCRYPTION_KEY = (node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")
-          $env:AUTH_PROVIDERS = "credentials"
-          $env:HOSTNAME = "127.0.0.1"
-          $env:DISABLE_REDIS_LOGS = "true"
-
-          node packages/db/migrations/sqlite/migrate.cjs packages/db/migrations/sqlite
-          if ($LASTEXITCODE -ne 0) {
-            throw "SQLite migration failed with exit code $LASTEXITCODE"
+          Remove-Item -LiteralPath $garnetZip, $garnetDir -Recurse -Force -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri $garnetUrl -OutFile $garnetZip
+          $garnetActualSha = (Get-FileHash -LiteralPath $garnetZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($garnetActualSha -ne $garnetExpectedSha) {
+            throw "Garnet SHA256 mismatch: expected $garnetExpectedSha, got $garnetActualSha"
+          }
+          Expand-Archive -LiteralPath $garnetZip -DestinationPath $garnetDir -Force
+          if (-not (Test-Path -LiteralPath $garnetExe -PathType Leaf)) {
+            throw "Garnet executable not found: $garnetExe"
           }
 
-          $stdoutLog = Join-Path $env:RUNNER_TEMP "homarr-smoke.stdout.log"
-          $stderrLog = Join-Path $env:RUNNER_TEMP "homarr-smoke.stderr.log"
-          Remove-Item -LiteralPath $stdoutLog, $stderrLog -ErrorAction SilentlyContinue
-
-          $serverProcess = Start-Process -FilePath "node" `
-            -ArgumentList "apps/nextjs/.output/standalone/apps/nextjs/server.js" `
+          $garnetStdout = Join-Path $env:RUNNER_TEMP "garnet.stdout.log"
+          $garnetStderr = Join-Path $env:RUNNER_TEMP "garnet.stderr.log"
+          Remove-Item -LiteralPath $garnetStdout, $garnetStderr -ErrorAction SilentlyContinue
+          $garnetProcess = Start-Process -FilePath $garnetExe `
+            -ArgumentList "--bind","127.0.0.1","--port","6379" `
+            -WorkingDirectory (Split-Path -Parent $garnetExe) `
             -PassThru -NoNewWindow `
-            -RedirectStandardOutput $stdoutLog `
-            -RedirectStandardError $stderrLog
+            -RedirectStandardOutput $garnetStdout `
+            -RedirectStandardError $garnetStderr
 
+          $homarrStdout = Join-Path $env:RUNNER_TEMP "homarr-smoke.stdout.log"
+          $homarrStderr = Join-Path $env:RUNNER_TEMP "homarr-smoke.stderr.log"
+          $smokeDatabase = Join-Path $env:RUNNER_TEMP "homarr-smoke.db"
+          Remove-Item -LiteralPath $homarrStdout, $homarrStderr, $smokeDatabase -ErrorAction SilentlyContinue
+
+          $serverProcess = $null
           try {
-            $isHealthy = $false
+            $garnetReady = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              Start-Sleep -Seconds 1
+              $client = New-Object System.Net.Sockets.TcpClient
+              try {
+                $client.Connect("127.0.0.1", 6379)
+                $client.Close()
+                $garnetReady = $true
+                break
+              } catch {
+                # Garnet is still starting.
+              }
+            }
+            if (-not $garnetReady) {
+              Write-Host "=== Garnet stdout ==="
+              Get-Content -LiteralPath $garnetStdout -Tail 80 -ErrorAction SilentlyContinue
+              Write-Host "=== Garnet stderr ==="
+              Get-Content -LiteralPath $garnetStderr -Tail 80 -ErrorAction SilentlyContinue
+              throw "Garnet did not accept TCP connections on 127.0.0.1:6379"
+            }
+
+            node -e "const Redis=require('ioredis'); (async()=>{const redis=new Redis({host:'127.0.0.1',port:6379,lazyConnect:true,maxRetriesPerRequest:1,connectTimeout:5000}); await redis.connect(); console.log('GARNET_PING', await redis.ping()); await redis.set('homarr:garnet:smoke','ok','EX',10); console.log('GARNET_GET', await redis.get('homarr:garnet:smoke')); await redis.hset('homarr:garnet:hash','field','value'); console.log('GARNET_HGET', await redis.hget('homarr:garnet:hash','field')); await redis.lpush('homarr:garnet:list','item'); console.log('GARNET_LLEN', await redis.llen('homarr:garnet:list')); const subscriber=new Redis({host:'127.0.0.1',port:6379,lazyConnect:true,maxRetriesPerRequest:1,connectTimeout:5000}); await subscriber.connect(); const messagePromise=new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('Garnet pub/sub timeout')),5000); subscriber.on('message',(_channel,message)=>{clearTimeout(timer); resolve(message);});}); await subscriber.subscribe('homarr:garnet:channel'); await redis.publish('homarr:garnet:channel','hello'); console.log('GARNET_PUBSUB', await messagePromise); await redis.expire('homarr:garnet:smoke',5); await redis.del('homarr:garnet:smoke','homarr:garnet:hash','homarr:garnet:list'); await subscriber.unsubscribe(); subscriber.disconnect(); redis.disconnect(); console.log('GARNET_OK');})().catch((error)=>{console.error(error); process.exit(1);});"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Garnet Redis compatibility check failed with exit code $LASTEXITCODE"
+            }
+
+            $env:NODE_ENV = "production"
+            $env:SKIP_ENV_VALIDATION = "true"
+            $env:DB_DIALECT = "sqlite"
+            $env:DB_DRIVER = "better-sqlite3"
+            $env:DB_URL = $smokeDatabase
+            $env:AUTH_SECRET = (node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")
+            $env:SECRET_ENCRYPTION_KEY = (node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")
+            $env:AUTH_PROVIDERS = "credentials"
+            $env:HOSTNAME = "127.0.0.1"
+            $env:REDIS_IS_EXTERNAL = "true"
+            $env:REDIS_HOST = "127.0.0.1"
+            $env:REDIS_PORT = "6379"
+            Remove-Item Env:CI -ErrorAction SilentlyContinue
+            Remove-Item Env:DISABLE_REDIS_LOGS -ErrorAction SilentlyContinue
+
+            node packages/db/migrations/sqlite/migrate.cjs packages/db/migrations/sqlite
+            if ($LASTEXITCODE -ne 0) {
+              throw "SQLite migration failed with exit code $LASTEXITCODE"
+            }
+
+            $serverProcess = Start-Process -FilePath "node" `
+              -ArgumentList "apps/nextjs/.output/standalone/apps/nextjs/server.js" `
+              -PassThru -NoNewWindow `
+              -RedirectStandardOutput $homarrStdout `
+              -RedirectStandardError $homarrStderr
+
+            $liveStatus = "NO_RESPONSE"
+            $readyStatus = "NO_RESPONSE"
+            $allHealthy = $false
             for ($attempt = 0; $attempt -lt 60; $attempt++) {
               Start-Sleep -Seconds 1
               try {
-                $response = Invoke-WebRequest -Uri "http://127.0.0.1:3000/api/health/live" -UseBasicParsing -TimeoutSec 3
-                if ($response.StatusCode -eq 200) {
-                  $isHealthy = $true
-                  break
-                }
+                $liveResponse = Invoke-WebRequest -Uri "http://127.0.0.1:3000/api/health/live" -UseBasicParsing -TimeoutSec 3
+                $liveStatus = [int]$liveResponse.StatusCode
               } catch {
-                # Server is still starting or returned an error; retry.
+                if ($_.Exception.Response) {
+                  $liveStatus = [int]$_.Exception.Response.StatusCode
+                }
+              }
+              try {
+                $readyResponse = Invoke-WebRequest -Uri "http://127.0.0.1:3000/api/health/ready" -UseBasicParsing -TimeoutSec 3
+                $readyStatus = [int]$readyResponse.StatusCode
+              } catch {
+                if ($_.Exception.Response) {
+                  $readyStatus = [int]$_.Exception.Response.StatusCode
+                }
+              }
+              if ($liveStatus -eq 200 -and $readyStatus -eq 200) {
+                $allHealthy = $true
+                break
               }
             }
 
-            if (-not $isHealthy) {
+            Write-Host "HOMARR_HEALTH_LIVE=$liveStatus"
+            Write-Host "HOMARR_HEALTH_READY=$readyStatus"
+
+            if (-not $allHealthy) {
               Write-Host "=== Homarr stdout ==="
-              Get-Content -LiteralPath $stdoutLog -Tail 80 -ErrorAction SilentlyContinue
+              Get-Content -LiteralPath $homarrStdout -Tail 80 -ErrorAction SilentlyContinue
               Write-Host "=== Homarr stderr ==="
-              Get-Content -LiteralPath $stderrLog -Tail 80 -ErrorAction SilentlyContinue
-              throw "Homarr server did not answer HTTP 200 on http://127.0.0.1:3000/api/health/live"
+              Get-Content -LiteralPath $homarrStderr -Tail 80 -ErrorAction SilentlyContinue
+              Write-Host "=== Garnet stdout ==="
+              Get-Content -LiteralPath $garnetStdout -Tail 80 -ErrorAction SilentlyContinue
+              Write-Host "=== Garnet stderr ==="
+              Get-Content -LiteralPath $garnetStderr -Tail 80 -ErrorAction SilentlyContinue
+              throw "Homarr health check failed: live=$liveStatus ready=$readyStatus"
             }
           } finally {
             if ($serverProcess -and -not $serverProcess.HasExited) {
               Stop-Process -Id $serverProcess.Id -Force
             }
-            Wait-Process -Id $serverProcess.Id -ErrorAction SilentlyContinue
+            if ($serverProcess) {
+              Wait-Process -Id $serverProcess.Id -ErrorAction SilentlyContinue
+            }
+            if ($garnetProcess -and -not $garnetProcess.HasExited) {
+              Stop-Process -Id $garnetProcess.Id -Force
+            }
+            if ($garnetProcess) {
+              Wait-Process -Id $garnetProcess.Id -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath $smokeDatabase, $garnetZip, $garnetDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $homarrStdout, $homarrStderr, $garnetStdout, $garnetStderr -Force -ErrorAction SilentlyContinue
           }
 
       - name: Upload build outputs
