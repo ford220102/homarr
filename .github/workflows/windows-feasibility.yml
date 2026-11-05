@@ -1,0 +1,63 @@
+name: Windows feasibility
+
+on:
+  push:
+    branches:
+      - windows-native
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_COLOR: 3
+  SKIP_ENV_VALIDATION: true
+  TURBO_TELEMETRY_DISABLED: 1
+
+jobs:
+  windows-build:
+    name: Windows x64 build and native dependency check
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.2
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies
+        shell: pwsh
+        run: bun install --frozen-lockfile --concurrent-scripts=1
+
+      - name: Verify native modules
+        shell: pwsh
+        run: |
+          node -e "const Database=require('better-sqlite3'); const db=new Database(':memory:'); console.log('better-sqlite3:', process.platform, process.arch, db.pragma('quick_check', { simple: true })); db.close();"
+          node -e "const bcrypt=require('bcrypt'); console.log('bcrypt:', bcrypt.hashSync('windows-feasibility', 4));"
+          node -e "const sharp=require('sharp'); console.log('sharp:', JSON.stringify(sharp.versions));"
+
+      - name: Build CLI and Next.js
+        shell: pwsh
+        run: bun run turbo run build --filter=@homarr/nextjs... --filter=@homarr/cli
+
+      - name: Upload build outputs
+        if: success()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v4.4.3
+        with:
+          name: windows-feasibility-build
+          path: |
+            apps/nextjs/.output/standalone
+            packages/cli/cli.cjs
+          if-no-files-found: error
+          retention-days: 7
