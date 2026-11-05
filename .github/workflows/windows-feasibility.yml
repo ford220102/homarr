@@ -90,6 +90,78 @@ jobs:
             throw "Forbidden secret-like files found in build outputs"
           }
 
+      - name: Run Windows server smoke test
+        shell: pwsh
+        run: |
+          $redisServer = Get-Command redis-server -ErrorAction SilentlyContinue
+          if ($redisServer) {
+            Write-Host "Native Redis found: $($redisServer.Source)"
+          } else {
+            Write-Warning "No native Redis server found on the runner. Redis-dependent features are not covered by this smoke test."
+          }
+
+          if (-not (Test-Path -LiteralPath "packages/db/migrations/sqlite/migrate.cjs" -PathType Leaf)) {
+            throw "Missing SQLite migration bundle: packages/db/migrations/sqlite/migrate.cjs"
+          }
+
+          $smokeDatabase = Join-Path $env:RUNNER_TEMP "homarr-smoke.db"
+          Remove-Item -LiteralPath $smokeDatabase -ErrorAction SilentlyContinue
+
+          $env:NODE_ENV = "production"
+          $env:SKIP_ENV_VALIDATION = "true"
+          $env:DB_DIALECT = "sqlite"
+          $env:DB_DRIVER = "better-sqlite3"
+          $env:DB_URL = $smokeDatabase
+          $env:AUTH_SECRET = (node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")
+          $env:SECRET_ENCRYPTION_KEY = (node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")
+          $env:AUTH_PROVIDERS = "credentials"
+          $env:HOSTNAME = "127.0.0.1"
+          $env:DISABLE_REDIS_LOGS = "true"
+
+          node packages/db/migrations/sqlite/migrate.cjs packages/db/migrations/sqlite
+          if ($LASTEXITCODE -ne 0) {
+            throw "SQLite migration failed with exit code $LASTEXITCODE"
+          }
+
+          $stdoutLog = Join-Path $env:RUNNER_TEMP "homarr-smoke.stdout.log"
+          $stderrLog = Join-Path $env:RUNNER_TEMP "homarr-smoke.stderr.log"
+          Remove-Item -LiteralPath $stdoutLog, $stderrLog -ErrorAction SilentlyContinue
+
+          $serverProcess = Start-Process -FilePath "node" `
+            -ArgumentList "apps/nextjs/.output/standalone/apps/nextjs/server.js" `
+            -PassThru -NoNewWindow `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog
+
+          try {
+            $isHealthy = $false
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              Start-Sleep -Seconds 1
+              try {
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:3000/api/health/live" -UseBasicParsing -TimeoutSec 3
+                if ($response.StatusCode -eq 200) {
+                  $isHealthy = $true
+                  break
+                }
+              } catch {
+                # Server is still starting or returned an error; retry.
+              }
+            }
+
+            if (-not $isHealthy) {
+              Write-Host "=== Homarr stdout ==="
+              Get-Content -LiteralPath $stdoutLog -Tail 80 -ErrorAction SilentlyContinue
+              Write-Host "=== Homarr stderr ==="
+              Get-Content -LiteralPath $stderrLog -Tail 80 -ErrorAction SilentlyContinue
+              throw "Homarr server did not answer HTTP 200 on http://127.0.0.1:3000/api/health/live"
+            }
+          } finally {
+            if ($serverProcess -and -not $serverProcess.HasExited) {
+              Stop-Process -Id $serverProcess.Id -Force
+            }
+            Wait-Process -Id $serverProcess.Id -ErrorAction SilentlyContinue
+          }
+
       - name: Upload build outputs
         if: success()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v4.4.3
