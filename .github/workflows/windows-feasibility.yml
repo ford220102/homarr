@@ -51,6 +51,45 @@ jobs:
         shell: pwsh
         run: bun run turbo run build --filter=@homarr/nextjs... --filter=@homarr/cli
 
+      - name: Verify required build outputs
+        shell: pwsh
+        run: |
+          $requiredFiles = @(
+            "apps/nextjs/.output/standalone/apps/nextjs/server.js",
+            "packages/cli/cli.cjs"
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Missing required build output: $file"
+            }
+            if ((Get-Item -LiteralPath $file).Length -eq 0) {
+              throw "Empty required build output: $file"
+            }
+          }
+
+          $requiredDirectories = @(
+            "apps/nextjs/.output/standalone/apps/nextjs/.next/server",
+            "apps/nextjs/.output/standalone/apps/nextjs/.next/static"
+          )
+          foreach ($directory in $requiredDirectories) {
+            if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+              throw "Missing required build output directory: $directory"
+            }
+            if (-not (Get-ChildItem -LiteralPath $directory -Force | Select-Object -First 1)) {
+              throw "Empty required build output directory: $directory"
+            }
+          }
+
+          $forbiddenFiles = Get-ChildItem -Path "apps/nextjs/.output/standalone", "packages/cli" -Recurse -Force -File -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Name -match '^\.env(\..*)?$' -or
+              $_.Extension -in '.env', '.key', '.pem', '.p12', '.pfx', '.secret'
+            }
+          if ($forbiddenFiles) {
+            $forbiddenFiles | ForEach-Object { Write-Error $_.FullName }
+            throw "Forbidden secret-like files found in build outputs"
+          }
+
       - name: Upload build outputs
         if: success()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v4.4.3
@@ -59,5 +98,6 @@ jobs:
           path: |
             apps/nextjs/.output/standalone
             packages/cli/cli.cjs
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
