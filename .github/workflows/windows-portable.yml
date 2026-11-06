@@ -84,6 +84,16 @@ jobs:
             throw "Forbidden secret-like files found in build outputs"
           }
 
+      - name: Patch Next.js loopback middleware rewrite
+        shell: pwsh
+        run: |
+          node scripts/patch-next-loopback.mjs apps/nextjs/.output/standalone
+
+      - name: Verify Next.js loopback patch
+        shell: pwsh
+        run: |
+          node scripts/patch-next-loopback.mjs apps/nextjs/.output/standalone --check
+
       - name: Prepare portable package
         shell: pwsh
         run: |
@@ -304,6 +314,19 @@ jobs:
                 throw "Fresh install GET /init returned an empty response"
               }
 
+              $logDirectory = Join-Path $dataPath "logs"
+              foreach ($logPath in @(
+                (Join-Path $logDirectory "homarr.stdout.log"),
+                (Join-Path $logDirectory "homarr.stderr.log")
+              )) {
+                if (Test-Path -LiteralPath $logPath) {
+                  $logContent = Get-Content -LiteralPath $logPath -Raw
+                  if ($logContent -match "Failed to proxy|ECONNRESET") {
+                    throw "Homarr log contains proxy failure: $logPath"
+                  }
+                }
+              }
+
               $enInitHeaders = Join-Path $env:RUNNER_TEMP "en-init.headers.txt"
               $enInitBody = Join-Path $env:RUNNER_TEMP "en-init.body.html"
               Remove-Item -LiteralPath $enInitHeaders, $enInitBody -Force -ErrorAction SilentlyContinue
@@ -311,11 +334,39 @@ jobs:
               $enInitCurlExit = $LASTEXITCODE
               Write-Host "PORTABLE_EN_INIT_STATUS=$enInitStatus"
               Write-Host "PORTABLE_EN_INIT_CURL_EXIT=$enInitCurlExit"
-              if ($enInitCurlExit -ne 0 -or $enInitStatus -ne "200") {
-                throw "Fresh install GET /en/init expected HTTP 200, got status=$enInitStatus curlExit=$enInitCurlExit"
+              if ($enInitCurlExit -ne 0) {
+                throw "Fresh install GET /en/init curl failed with exit=$enInitCurlExit"
               }
-              if (-not (Test-Path -LiteralPath $enInitBody) -or (Get-Item -LiteralPath $enInitBody).Length -eq 0) {
-                throw "Fresh install GET /en/init returned an empty response"
+              $enInitLocation = $null
+              if (Test-Path -LiteralPath $enInitHeaders) {
+                $enInitLocation = (Select-String -Path $enInitHeaders -Pattern '^Location:' | Select-Object -First 1).Line
+              }
+              Write-Host "PORTABLE_EN_INIT_LOCATION=$enInitLocation"
+              if ($enInitStatus -eq "200") {
+                $enInitContentType = $null
+                if (Test-Path -LiteralPath $enInitHeaders) {
+                  $enInitContentType = (Select-String -Path $enInitHeaders -Pattern '^Content-Type:' | Select-Object -First 1).Line
+                }
+                Write-Host "PORTABLE_EN_INIT_CONTENT_TYPE=$enInitContentType"
+                if ([string]::IsNullOrWhiteSpace($enInitContentType) -or $enInitContentType -notmatch "text/html") {
+                  throw "Fresh install GET /en/init expected HTML Content-Type, got $enInitContentType"
+                }
+                if (-not (Test-Path -LiteralPath $enInitBody) -or (Get-Item -LiteralPath $enInitBody).Length -eq 0) {
+                  throw "Fresh install GET /en/init returned an empty response"
+                }
+              } elseif ($enInitStatus -in @("307", "308")) {
+                if ([string]::IsNullOrWhiteSpace($enInitLocation) -or $enInitLocation -notmatch "/init") {
+                  throw "Fresh install GET /en/init expected redirect to /init, got $enInitLocation"
+                }
+                $enInitFollowStatus = & curl.exe --noproxy "*" -sS -L --max-redirs 5 -o NUL -w "%{http_code}" --max-time 15 "http://127.0.0.1:3000/en/init"
+                $enInitFollowExit = $LASTEXITCODE
+                Write-Host "PORTABLE_EN_INIT_FOLLOW_STATUS=$enInitFollowStatus"
+                Write-Host "PORTABLE_EN_INIT_FOLLOW_EXIT=$enInitFollowExit"
+                if ($enInitFollowExit -ne 0 -or $enInitFollowStatus -ne "200") {
+                  throw "Fresh install GET /en/init redirect did not end at HTTP 200, got status=$enInitFollowStatus exit=$enInitFollowExit"
+                }
+              } else {
+                throw "Fresh install GET /en/init expected 200 or redirect to /init, got $enInitStatus"
               }
 
               $localhostStatus = "NO_RESPONSE"

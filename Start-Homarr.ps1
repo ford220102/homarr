@@ -272,7 +272,6 @@ $env:SECRET_ENCRYPTION_KEY = $EncryptionKey
 $env:AUTH_PROVIDERS = "credentials"
 $env:HOSTNAME = "127.0.0.1"
 $env:PORT = "3000"
-$env:HOMARR_ORIGIN = "http://$($env:HOSTNAME):$($env:PORT)"
 $env:REDIS_IS_EXTERNAL = "true"
 $env:REDIS_HOST = "127.0.0.1"
 $env:REDIS_PORT = "6379"

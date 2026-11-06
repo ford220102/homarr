@@ -39,43 +39,6 @@ const getDefaultLocaleDedupedAsync = () => {
   return defaultLocalePromise;
 };
 
-const getSafeOrigin = (request: NextRequest): string => {
-  const configuredOrigin = process.env.HOMARR_ORIGIN;
-  if (configuredOrigin) {
-    try {
-      const parsed = new URL(configuredOrigin);
-      if (
-        (parsed.protocol === "http:" || parsed.protocol === "https:") &&
-        (parsed.hostname === "127.0.0.1" ||
-          parsed.hostname === "localhost" ||
-          parsed.hostname === "[::1]")
-      ) {
-        return parsed.origin;
-      }
-    } catch {
-      // Fall through to the request-derived origin below.
-    }
-  }
-
-  const host = request.headers.get("host") ?? request.nextUrl.host;
-  const hostWithoutPort = host.split(":")[0].toLowerCase();
-  const isLocalHost =
-    hostWithoutPort === "localhost" ||
-    hostWithoutPort === "127.0.0.1" ||
-    hostWithoutPort === "[::1]";
-  const protocol =
-    request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim() ??
-    request.nextUrl.protocol.replace(":", "");
-
-  if (isLocalHost && (protocol === "http" || protocol === "https")) {
-    return `${protocol}://${host}`;
-  }
-
-  // Fall back to the (normalized) request origin instead of trusting an
-  // arbitrary Host header.
-  return request.nextUrl.origin;
-};
-
 export async function proxy(request: NextRequest) {
   // Redirect to onboarding if it's not finished yet
   const pathname = request.nextUrl.pathname;
@@ -88,7 +51,7 @@ export async function proxy(request: NextRequest) {
   if (!isOnboardingFinished && !isOnboardingAccessRoute) {
     const currentOnboardingStep = await getOnboardingStepDedupedAsync();
     if (currentOnboardingStep !== "finish") {
-      return NextResponse.redirect(new URL("/init", getSafeOrigin(request)));
+      return NextResponse.redirect(new URL("/init", request.url));
     }
 
     isOnboardingFinished = true;
@@ -102,25 +65,6 @@ export async function proxy(request: NextRequest) {
     if (supportedLanguages.includes(configuredLocale as SupportedLanguage)) {
       defaultLocale = configuredLocale as SupportedLanguage;
     }
-  }
-
-  // Onboarding access routes must stay reachable without an external redirect
-  // loop when the app is accessed through 127.0.0.1. See proxy handling above.
-  if (!isOnboardingFinished && isOnboardingAccessRoute) {
-    const origin = getSafeOrigin(request);
-    const headers = new Headers(request.headers);
-    headers.set("accept-language", "");
-    headers.set("X-NEXT-INTL-LOCALE", defaultLocale);
-
-    const response = NextResponse.rewrite(
-      new URL(`/${defaultLocale}/${routeSegments.join("/")}${request.nextUrl.search}`, origin),
-      { request: { headers } },
-    );
-    response.cookies.set(localeCookieKey, defaultLocale, {
-      maxAge: 60 * 60 * 24 * 365,
-      path: "/",
-    });
-    return response;
   }
 
   // We don't want to fallback to accept-language header so we clear it
