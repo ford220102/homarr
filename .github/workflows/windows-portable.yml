@@ -1,0 +1,288 @@
+name: Windows portable
+
+on:
+  push:
+    branches:
+      - windows-native
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_COLOR: 3
+  SKIP_ENV_VALIDATION: true
+  TURBO_TELEMETRY_DISABLED: 1
+
+jobs:
+  windows-portable:
+    name: Build and test Windows portable package
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.2
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies
+        shell: pwsh
+        run: bun install --frozen-lockfile --concurrent-scripts=1
+
+      - name: Build application
+        shell: pwsh
+        run: bun run turbo run build --filter=@homarr/nextjs... --filter=@homarr/cli
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          $requiredFiles = @(
+            "apps/nextjs/.output/standalone/apps/nextjs/server.js",
+            "packages/cli/cli.cjs",
+            "packages/db/migrations/sqlite/migrate.cjs"
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Missing required build output: $file"
+            }
+            if ((Get-Item -LiteralPath $file).Length -eq 0) {
+              throw "Empty required build output: $file"
+            }
+          }
+
+          $requiredDirectories = @(
+            "apps/nextjs/.output/standalone/apps/nextjs/.next/server",
+            "apps/nextjs/.output/standalone/apps/nextjs/.next/static"
+          )
+          foreach ($directory in $requiredDirectories) {
+            if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+              throw "Missing required build output directory: $directory"
+            }
+            if (-not (Get-ChildItem -LiteralPath $directory -Force | Select-Object -First 1)) {
+              throw "Empty required build output directory: $directory"
+            }
+          }
+
+          $forbiddenFiles = Get-ChildItem -Path "apps/nextjs/.output/standalone", "packages/cli" -Recurse -Force -File -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Name -match '^\.env(\..*)?$' -or
+              $_.Extension -in '.env', '.key', '.pem', '.p12', '.pfx', '.secret'
+            }
+          if ($forbiddenFiles) {
+            $forbiddenFiles | ForEach-Object { Write-Error $_.FullName }
+            throw "Forbidden secret-like files found in build outputs"
+          }
+
+      - name: Prepare portable package
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "homarr-portable"
+          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $standalone = "apps/nextjs/.output/standalone"
+          if (-not (Test-Path -LiteralPath $standalone -PathType Container)) {
+            throw "Standalone build output is missing: $standalone"
+          }
+          Get-ChildItem -LiteralPath $standalone -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $stage -Recurse -Force
+          }
+
+          $migrationSource = "packages/db/migrations/sqlite"
+          $migrationTarget = Join-Path $stage "db\migrations\sqlite"
+          if (-not (Test-Path -LiteralPath (Join-Path $migrationSource "migrate.cjs") -PathType Leaf)) {
+            throw "SQLite migration bundle is missing"
+          }
+          New-Item -ItemType Directory -Force -Path $migrationTarget | Out-Null
+          Get-ChildItem -LiteralPath $migrationSource -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $migrationTarget -Recurse -Force
+          }
+
+          if (-not (Test-Path -LiteralPath "Start-Homarr.ps1" -PathType Leaf)) {
+            throw "Start-Homarr.ps1 is missing from the repository"
+          }
+          Copy-Item -LiteralPath "Start-Homarr.ps1" -Destination (Join-Path $stage "Start-Homarr.ps1") -Force
+          Set-Content -LiteralPath (Join-Path $stage "VERSION.txt") -Value "Homarr Windows Portable" -Encoding utf8
+
+          $nodeZip = Join-Path $env:RUNNER_TEMP "node.zip"
+          $nodeUrl = "https://nodejs.org/dist/v24.22.2/node-v24.22.2-win-x64.zip"
+          $nodeSha = "ca1bff5d8ead13c9f2ea404a176db46bd430704d5b5113734049fa365e7799e2"
+          Remove-Item -LiteralPath $nodeZip -Force -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri $nodeUrl -OutFile $nodeZip
+          $nodeActualSha = (Get-FileHash -LiteralPath $nodeZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($nodeActualSha -ne $nodeSha) {
+            throw "Node.js SHA256 mismatch: expected $nodeSha, got $nodeActualSha"
+          }
+
+          $nodeExtract = Join-Path $env:RUNNER_TEMP "node-extract"
+          Remove-Item -LiteralPath $nodeExtract -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $nodeZip -DestinationPath $nodeExtract -Force
+          $nodeSource = Get-ChildItem -LiteralPath $nodeExtract -Directory | Select-Object -First 1
+          if (-not $nodeSource) {
+            throw "Node.js archive did not contain an extraction directory"
+          }
+          $nodeTarget = Join-Path $stage "runtime\node"
+          New-Item -ItemType Directory -Force -Path $nodeTarget | Out-Null
+          Get-ChildItem -LiteralPath $nodeSource.FullName -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $nodeTarget -Recurse -Force
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $nodeTarget "node.exe") -PathType Leaf)) {
+            throw "Node.js executable is missing from the portable package"
+          }
+
+          $garnetZip = Join-Path $env:RUNNER_TEMP "garnet.zip"
+          $garnetUrl = "https://github.com/microsoft/garnet/releases/download/v2.2.8/win-x64-based-readytorun.zip"
+          $garnetSha = "41ab3d438c8e1b8d146c33bfb2d010dd514f687d7fd276b97511981839940d00"
+          Remove-Item -LiteralPath $garnetZip -Force -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri $garnetUrl -OutFile $garnetZip
+          $garnetActualSha = (Get-FileHash -LiteralPath $garnetZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($garnetActualSha -ne $garnetSha) {
+            throw "Garnet SHA256 mismatch: expected $garnetSha, got $garnetActualSha"
+          }
+          $garnetTarget = Join-Path $stage "runtime\garnet"
+          New-Item -ItemType Directory -Force -Path $garnetTarget | Out-Null
+          Expand-Archive -LiteralPath $garnetZip -DestinationPath $garnetTarget -Force
+          if (-not (Test-Path -LiteralPath (Join-Path $garnetTarget "net10.0\GarnetServer.exe") -PathType Leaf)) {
+            throw "Garnet executable is missing from the portable package"
+          }
+
+          $dotnetZip = Join-Path $env:RUNNER_TEMP "dotnet.zip"
+          $dotnetUrl = "https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.0/dotnet-runtime-10.0.0-win-x64.zip"
+          $dotnetSha512 = "4f785ed52d49545e328d7526fd6fe80e2d0c84bc90c5f905df631ef87b9d3efd211d10670aa87d5e7b87cd2f54d3dedb6e5be78027d5533153670e1186230825"
+          Remove-Item -LiteralPath $dotnetZip -Force -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri $dotnetUrl -OutFile $dotnetZip
+          $dotnetActualSha512 = (Get-FileHash -LiteralPath $dotnetZip -Algorithm SHA512).Hash.ToLowerInvariant()
+          if ($dotnetActualSha512 -ne $dotnetSha512) {
+            throw "dotnet runtime SHA512 mismatch: expected $dotnetSha512, got $dotnetActualSha512"
+          }
+          $dotnetTarget = Join-Path $stage "runtime\dotnet"
+          New-Item -ItemType Directory -Force -Path $dotnetTarget | Out-Null
+          Expand-Archive -LiteralPath $dotnetZip -DestinationPath $dotnetTarget -Force
+          if (-not (Test-Path -LiteralPath (Join-Path $dotnetTarget "dotnet.exe") -PathType Leaf)) {
+            throw "dotnet runtime is missing from the portable package"
+          }
+
+          $migratorNativeDependency = Join-Path $stage "node_modules\better-sqlite3\build\Release\better_sqlite3.node"
+          if (-not (Test-Path -LiteralPath $migratorNativeDependency -PathType Leaf)) {
+            throw "Portable package is missing the SQLite native dependency: $migratorNativeDependency"
+          }
+
+          $zipPath = Join-Path $env:RUNNER_TEMP "homarr-portable.zip"
+          Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+          if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+            throw "Portable ZIP was not created"
+          }
+          $zipSize = (Get-Item -LiteralPath $zipPath).Length
+          Write-Host "PORTABLE_ZIP=$zipPath"
+          Write-Host "PORTABLE_ZIP_SIZE=$zipSize"
+
+      - name: Test portable package from an independent directory
+        shell: pwsh
+        run: |
+          $zipPath = Join-Path $env:RUNNER_TEMP "homarr-portable.zip"
+          $testRoot = Join-Path $env:RUNNER_TEMP "homarr portable test"
+          $dataPath = Join-Path $env:RUNNER_TEMP "homarr portable data"
+          Remove-Item -LiteralPath $testRoot, $dataPath -Recurse -Force -ErrorAction SilentlyContinue
+
+          try {
+            Expand-Archive -LiteralPath $zipPath -DestinationPath $testRoot -Force
+            $scriptPath = Join-Path $testRoot "Start-Homarr.ps1"
+            if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+              throw "Start-Homarr.ps1 is missing from the portable package"
+            }
+
+            $syntaxErrors = $null
+            $syntaxTokens = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$syntaxTokens, [ref]$syntaxErrors)
+            if ($syntaxErrors.Count -gt 0) {
+              $syntaxErrors | ForEach-Object { Write-Error $_.Message }
+              throw "Start-Homarr.ps1 has PowerShell syntax errors"
+            }
+
+            & $scriptPath -NoWait -DataPath $dataPath
+            if ($LASTEXITCODE -ne 0) {
+              throw "Start-Homarr.ps1 -NoWait failed with exit code $LASTEXITCODE"
+            }
+
+            $liveStatus = "NO_RESPONSE"
+            $readyStatus = "NO_RESPONSE"
+            $allHealthy = $false
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              Start-Sleep -Seconds 1
+              try {
+                $liveResponse = Invoke-WebRequest -Uri "http://127.0.0.1:3000/api/health/live" -UseBasicParsing -TimeoutSec 3
+                $liveStatus = [int]$liveResponse.StatusCode
+              } catch {
+                if ($_.Exception.Response) {
+                  $liveStatus = [int]$_.Exception.Response.StatusCode
+                }
+              }
+              try {
+                $readyResponse = Invoke-WebRequest -Uri "http://127.0.0.1:3000/api/health/ready" -UseBasicParsing -TimeoutSec 3
+                $readyStatus = [int]$readyResponse.StatusCode
+              } catch {
+                if ($_.Exception.Response) {
+                  $readyStatus = [int]$_.Exception.Response.StatusCode
+                }
+              }
+              Write-Host "PORTABLE_HEALTH_LIVE=$liveStatus"
+              Write-Host "PORTABLE_HEALTH_READY=$readyStatus"
+              if ($liveStatus -eq 200 -and $readyStatus -eq 200) {
+                $allHealthy = $true
+                break
+              }
+            }
+
+            if (-not $allHealthy) {
+              $logDirectory = Join-Path $dataPath "logs"
+              foreach ($logPath in @(
+                (Join-Path $logDirectory "homarr.stdout.log"),
+                (Join-Path $logDirectory "homarr.stderr.log"),
+                (Join-Path $logDirectory "garnet.stdout.log"),
+                (Join-Path $logDirectory "garnet.stderr.log")
+              )) {
+                if (Test-Path -LiteralPath $logPath) {
+                  Write-Host "===== $logPath ====="
+                  Get-Content -LiteralPath $logPath -Tail 80 -ErrorAction SilentlyContinue
+                }
+              }
+              throw "Portable health check failed: live=$liveStatus ready=$readyStatus"
+            }
+
+            & $scriptPath -Stop -DataPath $dataPath
+            if ($LASTEXITCODE -ne 0) {
+              throw "Start-Homarr.ps1 -Stop failed with exit code $LASTEXITCODE"
+            }
+          } catch {
+            Write-Error $_
+            throw
+          } finally {
+            try {
+              & (Join-Path $testRoot "Start-Homarr.ps1") -Stop -DataPath $dataPath
+            } catch {
+              Write-Warning "Portable cleanup stop failed: $($_.Exception.Message)"
+            }
+            Remove-Item -LiteralPath $testRoot, $dataPath -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload portable package
+        if: success()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v4.4.3
+        with:
+          name: homarr-portable
+          path: ${{ runner.temp }}/homarr-portable.zip
+          if-no-files-found: error
+          retention-days: 7
