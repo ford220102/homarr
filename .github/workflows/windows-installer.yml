@@ -316,7 +316,28 @@ jobs:
             }
             throw
           } finally {
-            try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $installRoot "Start-Homarr.ps1") -Stop -DataPath $dataPath } catch { }
+            $cleanupScript = Join-Path $installRoot "Start-Homarr.ps1"
+            if (Test-Path -LiteralPath $cleanupScript -PathType Leaf) {
+              try {
+                $cleanupProcess = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+                  "-NoProfile",
+                  "-ExecutionPolicy",
+                  "Bypass",
+                  "-File",
+                  "`"$cleanupScript`"",
+                  "-Stop",
+                  "-DataPath",
+                  "`"$dataPath`""
+                ) -Wait -PassThru
+                if ($cleanupProcess.ExitCode -ne 0) {
+                  Write-Host "Installer cleanup warning: Start-Homarr.ps1 -Stop exited with code $($cleanupProcess.ExitCode)"
+                }
+              } catch {
+                Write-Host "Installer cleanup warning: $($_.Exception.Message)"
+              }
+            } else {
+              Write-Host "Installer cleanup: Start-Homarr.ps1 already removed by uninstaller; skipping stop."
+            }
             Remove-Item -LiteralPath $installRoot -Recurse -Force -ErrorAction SilentlyContinue
           }
 
