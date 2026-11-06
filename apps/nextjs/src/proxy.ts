@@ -39,6 +39,38 @@ const getDefaultLocaleDedupedAsync = () => {
   return defaultLocalePromise;
 };
 
+const getSafeOrigin = (request: NextRequest): string => {
+  const privateOrigin = process.env.__NEXT_PRIVATE_ORIGIN;
+  if (privateOrigin) {
+    try {
+      const parsed = new URL(privateOrigin);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        return parsed.origin;
+      }
+    } catch {
+      // Fall through to the request-derived origin below.
+    }
+  }
+
+  const host = request.headers.get("host") ?? request.nextUrl.host;
+  const hostWithoutPort = host.split(":")[0].toLowerCase();
+  const isLocalHost =
+    hostWithoutPort === "localhost" ||
+    hostWithoutPort === "127.0.0.1" ||
+    hostWithoutPort === "[::1]";
+  const protocol =
+    request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim() ??
+    request.nextUrl.protocol.replace(":", "");
+
+  if (isLocalHost && (protocol === "http" || protocol === "https")) {
+    return `${protocol}://${host}`;
+  }
+
+  // Fall back to the (normalized) request origin instead of trusting an
+  // arbitrary Host header.
+  return request.nextUrl.origin;
+};
+
 export async function proxy(request: NextRequest) {
   // Redirect to onboarding if it's not finished yet
   const pathname = request.nextUrl.pathname;
@@ -51,11 +83,7 @@ export async function proxy(request: NextRequest) {
   if (!isOnboardingFinished && !isOnboardingAccessRoute) {
     const currentOnboardingStep = await getOnboardingStepDedupedAsync();
     if (currentOnboardingStep !== "finish") {
-      const host = request.headers.get("host") ?? request.nextUrl.host;
-      const protocol =
-        request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim() ??
-        request.nextUrl.protocol.replace(":", "");
-      return NextResponse.redirect(new URL("/init", `${protocol}://${host}`));
+      return NextResponse.redirect(new URL("/init", getSafeOrigin(request)));
     }
 
     isOnboardingFinished = true;
@@ -74,16 +102,13 @@ export async function proxy(request: NextRequest) {
   // Onboarding access routes must stay reachable without an external redirect
   // loop when the app is accessed through 127.0.0.1. See proxy handling above.
   if (!isOnboardingFinished && isOnboardingAccessRoute) {
-    const host = request.headers.get("host") ?? request.nextUrl.host;
-    const protocol =
-      request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim() ??
-      request.nextUrl.protocol.replace(":", "");
+    const origin = getSafeOrigin(request);
     const headers = new Headers(request.headers);
     headers.set("accept-language", "");
     headers.set("X-NEXT-INTL-LOCALE", defaultLocale);
 
     const response = NextResponse.rewrite(
-      new URL(`/${defaultLocale}/${routeSegments.join("/")}${request.nextUrl.search}`, `${protocol}://${host}`),
+      new URL(`/${defaultLocale}/${routeSegments.join("/")}${request.nextUrl.search}`, origin),
       { request: { headers } },
     );
     response.cookies.set(localeCookieKey, defaultLocale, {
