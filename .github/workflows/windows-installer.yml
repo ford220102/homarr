@@ -178,13 +178,28 @@ jobs:
           $dataPath = "C:\Temp\Homarr Install Data"
           Remove-Item -LiteralPath $installRoot, $dataPath -Recurse -Force -ErrorAction SilentlyContinue
 
+          $installLog = Join-Path $env:RUNNER_TEMP "homarr-install.log"
+          Remove-Item -LiteralPath $installLog -Force -ErrorAction SilentlyContinue
           try {
-            & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="$installRoot"
-            if ($LASTEXITCODE -ne 0) {
-              throw "Silent installation failed with exit code $LASTEXITCODE"
+            $installProcess = Start-Process -FilePath $installer -ArgumentList @(
+              "/VERYSILENT",
+              "/SUPPRESSMSGBOXES",
+              "/NORESTART",
+              "/DIR=`"$installRoot`"",
+              "/LOG=`"$installLog`""
+            ) -Wait -PassThru
+            if ($installProcess.ExitCode -ne 0) {
+              if (Test-Path -LiteralPath $installLog) {
+                Write-Host "===== INSTALLER LOG ====="
+                Get-Content -LiteralPath $installLog -Tail 150
+              }
+              throw "Silent installation failed with exit code $($installProcess.ExitCode)"
             }
 
             $startScript = Join-Path $installRoot "Start-Homarr.ps1"
+            if (-not (Test-Path -LiteralPath $startScript -PathType Leaf)) {
+              throw "Start-Homarr.ps1 was not installed"
+            }
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "scripts\validate-start.ps1" -Path $startScript
             if ($LASTEXITCODE -ne 0) {
               throw "Start-Homarr.ps1 is not compatible with Windows PowerShell 5.1"
@@ -256,9 +271,13 @@ jobs:
 
             $uninstaller = Join-Path $installRoot "unins000.exe"
             if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
-              & $uninstaller /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-              if ($LASTEXITCODE -ne 0) {
-                throw "Uninstallation failed with exit code $LASTEXITCODE"
+              $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList @(
+                "/VERYSILENT",
+                "/SUPPRESSMSGBOXES",
+                "/NORESTART"
+              ) -Wait -PassThru
+              if ($uninstallProcess.ExitCode -ne 0) {
+                throw "Uninstallation failed with exit code $($uninstallProcess.ExitCode)"
               }
             }
 
@@ -267,6 +286,10 @@ jobs:
             }
           } catch {
             Write-Host "Installer test exception: $($_.Exception.Message)"
+            if (Test-Path -LiteralPath $installLog) {
+              Write-Host "===== INSTALLER LOG (tail) ====="
+              Get-Content -LiteralPath $installLog -Tail 150
+            }
             $logDirectory = Join-Path $dataPath "logs"
             foreach ($logPath in @(
               (Join-Path $logDirectory "homarr.stdout.log"),
