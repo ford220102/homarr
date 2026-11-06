@@ -51,7 +51,11 @@ export async function proxy(request: NextRequest) {
   if (!isOnboardingFinished && !isOnboardingAccessRoute) {
     const currentOnboardingStep = await getOnboardingStepDedupedAsync();
     if (currentOnboardingStep !== "finish") {
-      return NextResponse.redirect(new URL("/init", request.url));
+      const host = request.headers.get("host") ?? request.nextUrl.host;
+      const protocol =
+        request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim() ??
+        request.nextUrl.protocol.replace(":", "");
+      return NextResponse.redirect(new URL("/init", `${protocol}://${host}`));
     }
 
     isOnboardingFinished = true;
@@ -65,6 +69,28 @@ export async function proxy(request: NextRequest) {
     if (supportedLanguages.includes(configuredLocale as SupportedLanguage)) {
       defaultLocale = configuredLocale as SupportedLanguage;
     }
+  }
+
+  // Onboarding access routes must stay reachable without an external redirect
+  // loop when the app is accessed through 127.0.0.1. See proxy handling above.
+  if (!isOnboardingFinished && isOnboardingAccessRoute) {
+    const host = request.headers.get("host") ?? request.nextUrl.host;
+    const protocol =
+      request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim() ??
+      request.nextUrl.protocol.replace(":", "");
+    const headers = new Headers(request.headers);
+    headers.set("accept-language", "");
+    headers.set("X-NEXT-INTL-LOCALE", defaultLocale);
+
+    const response = NextResponse.rewrite(
+      new URL(`/${defaultLocale}/${routeSegments.join("/")}${request.nextUrl.search}`, `${protocol}://${host}`),
+      { request: { headers } },
+    );
+    response.cookies.set(localeCookieKey, defaultLocale, {
+      maxAge: 60 * 60 * 24 * 365,
+      path: "/",
+    });
+    return response;
   }
 
   // We don't want to fallback to accept-language header so we clear it

@@ -262,6 +262,41 @@ jobs:
               throw "Portable health check failed: live=$liveStatus ready=$readyStatus"
             }
 
+            $initStatus = "NO_RESPONSE"
+            try {
+              $initResponse = Invoke-WebRequest -Uri "http://127.0.0.1:3000/init" -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 5
+              $initStatus = [int]$initResponse.StatusCode
+            } catch {
+              if ($_.Exception.Response) {
+                $initStatus = [int]$_.Exception.Response.StatusCode
+              }
+            }
+            Write-Host "PORTABLE_INIT_STATUS=$initStatus"
+            if ($initStatus -ne 200) {
+              throw "Fresh install GET /init expected HTTP 200, got $initStatus"
+            }
+
+            $rootStatus = "NO_RESPONSE"
+            $rootLocation = $null
+            try {
+              $rootResponse = Invoke-WebRequest -Uri "http://127.0.0.1:3000/" -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 5
+              $rootStatus = [int]$rootResponse.StatusCode
+              $rootLocation = $rootResponse.Headers.Location
+            } catch {
+              if ($_.Exception.Response) {
+                $rootStatus = [int]$_.Exception.Response.StatusCode
+                $rootLocation = $_.Exception.Response.Headers.Location
+              }
+            }
+            Write-Host "PORTABLE_ROOT_STATUS=$rootStatus"
+            Write-Host "PORTABLE_ROOT_LOCATION=$rootLocation"
+            if ($rootStatus -notin @(301, 302, 303, 307, 308)) {
+              throw "Fresh install GET / expected a redirect to initialization, got $rootStatus"
+            }
+            if ([string]::IsNullOrWhiteSpace($rootLocation) -or $rootLocation.ToString() -notmatch "/init") {
+              throw "Fresh install GET / expected redirect location containing /init, got $rootLocation"
+            }
+
             & $scriptPath -Stop -DataPath $dataPath
             if ($LASTEXITCODE -ne 0) {
               throw "Start-Homarr.ps1 -Stop failed with exit code $LASTEXITCODE"
