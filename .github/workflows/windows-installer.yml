@@ -1,0 +1,295 @@
+name: Windows installer
+
+on:
+  push:
+    branches:
+      - windows-native
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_COLOR: 3
+  SKIP_ENV_VALIDATION: true
+  TURBO_TELEMETRY_DISABLED: 1
+
+jobs:
+  windows-installer:
+    name: Build and test Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.2
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies
+        shell: pwsh
+        run: bun install --frozen-lockfile --concurrent-scripts=1
+
+      - name: Build application
+        shell: pwsh
+        run: bun run turbo run build --filter=@homarr/nextjs... --filter=@homarr/cli
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          $requiredFiles = @(
+            "apps/nextjs/.output/standalone/apps/nextjs/server.js",
+            "packages/cli/cli.cjs",
+            "packages/db/migrations/sqlite/migrate.cjs"
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Missing required build output: $file"
+            }
+          }
+
+      - name: Patch Next.js loopback middleware rewrite
+        shell: pwsh
+        run: node scripts/patch-next-loopback.mjs apps/nextjs/.output/standalone
+
+      - name: Verify Next.js loopback patch
+        shell: pwsh
+        run: node scripts/patch-next-loopback.mjs apps/nextjs/.output/standalone --check
+
+      - name: Prepare portable stage
+        shell: pwsh
+        run: |
+          $stage = "installer\stage"
+          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $standalone = "apps/nextjs/.output/standalone"
+          Get-ChildItem -LiteralPath $standalone -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $stage -Recurse -Force
+          }
+
+          $migrationSource = "packages/db/migrations/sqlite"
+          $migrationTarget = Join-Path $stage "db\migrations\sqlite"
+          New-Item -ItemType Directory -Force -Path $migrationTarget | Out-Null
+          Get-ChildItem -LiteralPath $migrationSource -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $migrationTarget -Recurse -Force
+          }
+
+          Copy-Item -LiteralPath "Start-Homarr.ps1" -Destination (Join-Path $stage "Start-Homarr.ps1") -Force
+
+          $nodeZip = Join-Path $env:RUNNER_TEMP "node.zip"
+          $nodeUrl = "https://nodejs.org/dist/v24.22.2/node-v24.22.2-win-x64.zip"
+          $nodeSha = "ca1bff5d8ead13c9f2ea404a176db46bd430704d5b5113734049fa365e7799e2"
+          Remove-Item -LiteralPath $nodeZip -Force -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri $nodeUrl -OutFile $nodeZip
+          $nodeActualSha = (Get-FileHash -LiteralPath $nodeZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($nodeActualSha -ne $nodeSha) {
+            throw "Node.js SHA256 mismatch: expected $nodeSha, got $nodeActualSha"
+          }
+          $nodeExtract = Join-Path $env:RUNNER_TEMP "node-extract"
+          Remove-Item -LiteralPath $nodeExtract -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $nodeZip -DestinationPath $nodeExtract -Force
+          $nodeSource = Get-ChildItem -LiteralPath $nodeExtract -Directory | Select-Object -First 1
+          $nodeTarget = Join-Path $stage "runtime\node"
+          New-Item -ItemType Directory -Force -Path $nodeTarget | Out-Null
+          Get-ChildItem -LiteralPath $nodeSource.FullName -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $nodeTarget -Recurse -Force
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $nodeTarget "node.exe") -PathType Leaf)) {
+            throw "Node.js executable is missing from the installer stage"
+          }
+
+          $garnetZip = Join-Path $env:RUNNER_TEMP "garnet.zip"
+          $garnetUrl = "https://github.com/microsoft/garnet/releases/download/v2.2.8/win-x64-based-readytorun.zip"
+          $garnetSha = "41ab3d438c8e1b8d146c33bfb2d010dd514f687d7fd276b97511981839940d00"
+          Remove-Item -LiteralPath $garnetZip -Force -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri $garnetUrl -OutFile $garnetZip
+          $garnetActualSha = (Get-FileHash -LiteralPath $garnetZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($garnetActualSha -ne $garnetSha) {
+            throw "Garnet SHA256 mismatch: expected $garnetSha, got $garnetActualSha"
+          }
+          $garnetTarget = Join-Path $stage "runtime\garnet"
+          New-Item -ItemType Directory -Force -Path $garnetTarget | Out-Null
+          Expand-Archive -LiteralPath $garnetZip -DestinationPath $garnetTarget -Force
+          if (-not (Test-Path -LiteralPath (Join-Path $garnetTarget "net10.0\GarnetServer.exe") -PathType Leaf)) {
+            throw "Garnet executable is missing from the installer stage"
+          }
+
+          $dotnetZip = Join-Path $env:RUNNER_TEMP "dotnet.zip"
+          $dotnetUrl = "https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.0/dotnet-runtime-10.0.0-win-x64.zip"
+          $dotnetSha512 = "4f785ed52d49545e328d7526fd6fe80e2d0c84bc90c5f905df631ef87b9d3efd211d10670aa87d5e7b87cd2f54d3dedb6e5be78027d5533153670e1186230825"
+          Remove-Item -LiteralPath $dotnetZip -Force -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri $dotnetUrl -OutFile $dotnetZip
+          $dotnetActualSha512 = (Get-FileHash -LiteralPath $dotnetZip -Algorithm SHA512).Hash.ToLowerInvariant()
+          if ($dotnetActualSha512 -ne $dotnetSha512) {
+            throw "dotnet runtime SHA512 mismatch: expected $dotnetSha512, got $dotnetActualSha512"
+          }
+          $dotnetTarget = Join-Path $stage "runtime\dotnet"
+          New-Item -ItemType Directory -Force -Path $dotnetTarget | Out-Null
+          Expand-Archive -LiteralPath $dotnetZip -DestinationPath $dotnetTarget -Force
+          if (-not (Test-Path -LiteralPath (Join-Path $dotnetTarget "dotnet.exe") -PathType Leaf)) {
+            throw "dotnet runtime is missing from the installer stage"
+          }
+
+          if (-not (Test-Path -LiteralPath (Join-Path $stage "node_modules\better-sqlite3\build\Release\better_sqlite3.node") -PathType Leaf)) {
+            throw "Portable stage is missing the SQLite native dependency"
+          }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $candidate = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+              $iscc = $candidate
+            }
+          } else {
+            $iscc = $iscc.Source
+          }
+          if (-not $iscc -or -not (Test-Path -LiteralPath $iscc -PathType Leaf)) {
+            throw "Inno Setup compiler (ISCC.exe) was not found"
+          }
+          & $iscc installer\Homarr.iss
+
+      - name: Test installer
+        shell: pwsh
+        run: |
+          $installer = "artifacts\Homarr-Windows-Setup.exe"
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Installer was not created"
+          }
+
+          $installRoot = "C:\Temp\Homarr Install Test"
+          $dataPath = "C:\Temp\Homarr Install Data"
+          Remove-Item -LiteralPath $installRoot, $dataPath -Recurse -Force -ErrorAction SilentlyContinue
+
+          try {
+            & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="$installRoot"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Silent installation failed with exit code $LASTEXITCODE"
+            }
+
+            $startScript = Join-Path $installRoot "Start-Homarr.ps1"
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "scripts\validate-start.ps1" -Path $startScript
+            if ($LASTEXITCODE -ne 0) {
+              throw "Start-Homarr.ps1 is not compatible with Windows PowerShell 5.1"
+            }
+
+            $requiredInstalledFiles = @(
+              "runtime\node\node.exe",
+              "runtime\garnet\net10.0\GarnetServer.exe",
+              "runtime\dotnet\dotnet.exe",
+              "node_modules\better-sqlite3\build\Release\better_sqlite3.node",
+              "apps\nextjs\.next\static",
+              "node_modules\next\dist\server\lib\router-utils\resolve-routes.js"
+            )
+            foreach ($relativePath in $requiredInstalledFiles) {
+              $fullPath = Join-Path $installRoot $relativePath
+              if (-not (Test-Path -LiteralPath $fullPath)) {
+                throw "Installed package is missing required file: $relativePath"
+              }
+            }
+            & node scripts/patch-next-loopback.mjs $installRoot --check
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed package failed the Next.js loopback patch check"
+            }
+
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $startScript -NoWait -DataPath $dataPath
+            if ($LASTEXITCODE -ne 0) {
+              throw "Start-Homarr.ps1 -NoWait failed with exit code $LASTEXITCODE"
+            }
+
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              Start-Sleep -Seconds 1
+              try {
+                $readyResponse = Invoke-WebRequest -Uri "http://127.0.0.1:3000/api/health/ready" -UseBasicParsing -TimeoutSec 3
+                if ([int]$readyResponse.StatusCode -eq 200) {
+                  $ready = $true
+                  break
+                }
+              } catch {
+                if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 200) {
+                  $ready = $true
+                  break
+                }
+              }
+            }
+            if (-not $ready) {
+              throw "Installed Homarr did not become ready"
+            }
+
+            $initHeaders = Join-Path $env:RUNNER_TEMP "installed-init.headers.txt"
+            $initBody = Join-Path $env:RUNNER_TEMP "installed-init.body.html"
+            Remove-Item -LiteralPath $initHeaders, $initBody -Force -ErrorAction SilentlyContinue
+            $initStatus = & curl.exe --noproxy "*" -sS -D $initHeaders -o $initBody -w "%{http_code}" --max-time 45 "http://127.0.0.1:3000/init"
+            $initCurlExit = $LASTEXITCODE
+            Write-Host "INSTALLED_INIT_STATUS=$initStatus"
+            Write-Host "INSTALLED_INIT_CURL_EXIT=$initCurlExit"
+            if ($initCurlExit -ne 0 -or $initStatus -ne "200") {
+              throw "Installed Homarr GET /init expected HTTP 200, got $initStatus"
+            }
+            if (-not (Test-Path -LiteralPath $initBody) -or (Get-Item -LiteralPath $initBody).Length -eq 0) {
+              throw "Installed Homarr GET /init returned an empty response"
+            }
+
+            $startScript = Join-Path $installRoot "Start-Homarr.ps1"
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $startScript -Stop -DataPath $dataPath
+            if ($LASTEXITCODE -ne 0) {
+              throw "Start-Homarr.ps1 -Stop failed with exit code $LASTEXITCODE"
+            }
+
+            $uninstaller = Join-Path $installRoot "unins000.exe"
+            if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
+              & $uninstaller /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+              if ($LASTEXITCODE -ne 0) {
+                throw "Uninstallation failed with exit code $LASTEXITCODE"
+              }
+            }
+
+            if (-not (Test-Path -LiteralPath (Join-Path $dataPath "db\homarr.db") -PathType Leaf)) {
+              throw "Uninstallation removed user data"
+            }
+          } catch {
+            Write-Host "Installer test exception: $($_.Exception.Message)"
+            $logDirectory = Join-Path $dataPath "logs"
+            foreach ($logPath in @(
+              (Join-Path $logDirectory "homarr.stdout.log"),
+              (Join-Path $logDirectory "homarr.stderr.log"),
+              (Join-Path $logDirectory "garnet.stdout.log"),
+              (Join-Path $logDirectory "garnet.stderr.log")
+            )) {
+              if (Test-Path -LiteralPath $logPath) {
+                Write-Host "===== $logPath (tail) ====="
+                Get-Content -LiteralPath $logPath -Tail 100
+              }
+            }
+            throw
+          } finally {
+            try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $installRoot "Start-Homarr.ps1") -Stop -DataPath $dataPath } catch { }
+            Remove-Item -LiteralPath $installRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload installer
+        if: success()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v4.4.3
+        with:
+          name: homarr-windows-setup
+          path: artifacts/Homarr-Windows-Setup.exe
+          if-no-files-found: error
+          retention-days: 7
