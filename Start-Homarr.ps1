@@ -89,9 +89,14 @@ function Get-StoredSecret {
         throw "Stored secret '$Name' is invalid: $Path"
     }
 
-    $bytes = [byte[]]::new(32)
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-    $value = [Convert]::ToHexString($bytes).ToLowerInvariant()
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    } finally {
+        $rng.Dispose()
+    }
+    $value = [BitConverter]::ToString($bytes).Replace("-", "").ToLowerInvariant()
 
     $parent = Split-Path -Parent $Path
     New-Item -ItemType Directory -Force -Path $parent | Out-Null

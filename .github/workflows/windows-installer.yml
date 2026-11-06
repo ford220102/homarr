@@ -249,6 +249,18 @@ jobs:
               throw "Installed Homarr did not become ready"
             }
 
+            $authSecretPath = Join-Path $dataPath "secrets\auth-secret.txt"
+            $encryptionKeyPath = Join-Path $dataPath "secrets\encryption-key.txt"
+            foreach ($secretPath in @($authSecretPath, $encryptionKeyPath)) {
+              if (-not (Test-Path -LiteralPath $secretPath -PathType Leaf)) {
+                throw "Get-StoredSecret did not create $secretPath"
+              }
+              $secretValue = (Get-Content -LiteralPath $secretPath -Raw).Trim()
+              if ($secretValue -notmatch '^[0-9a-fA-F]{64}$') {
+                throw "Get-StoredSecret created an invalid secret in $secretPath"
+              }
+            }
+
             $initHeaders = Join-Path $env:RUNNER_TEMP "installed-init.headers.txt"
             $initBody = Join-Path $env:RUNNER_TEMP "installed-init.body.html"
             Remove-Item -LiteralPath $initHeaders, $initBody -Force -ErrorAction SilentlyContinue
