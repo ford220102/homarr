@@ -40,11 +40,16 @@ const getDefaultLocaleDedupedAsync = () => {
 };
 
 const getSafeOrigin = (request: NextRequest): string => {
-  const privateOrigin = process.env.__NEXT_PRIVATE_ORIGIN;
-  if (privateOrigin) {
+  const configuredOrigin = process.env.HOMARR_ORIGIN;
+  if (configuredOrigin) {
     try {
-      const parsed = new URL(privateOrigin);
-      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      const parsed = new URL(configuredOrigin);
+      if (
+        (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+        (parsed.hostname === "127.0.0.1" ||
+          parsed.hostname === "localhost" ||
+          parsed.hostname === "[::1]")
+      ) {
         return parsed.origin;
       }
     } catch {

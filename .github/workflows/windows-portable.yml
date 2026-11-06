@@ -304,6 +304,31 @@ jobs:
                 throw "Fresh install GET /init returned an empty response"
               }
 
+              $enInitHeaders = Join-Path $env:RUNNER_TEMP "en-init.headers.txt"
+              $enInitBody = Join-Path $env:RUNNER_TEMP "en-init.body.html"
+              Remove-Item -LiteralPath $enInitHeaders, $enInitBody -Force -ErrorAction SilentlyContinue
+              $enInitStatus = & curl.exe --noproxy "*" -sS -D $enInitHeaders -o $enInitBody -w "%{http_code}" --max-time 15 "http://127.0.0.1:3000/en/init"
+              $enInitCurlExit = $LASTEXITCODE
+              Write-Host "PORTABLE_EN_INIT_STATUS=$enInitStatus"
+              Write-Host "PORTABLE_EN_INIT_CURL_EXIT=$enInitCurlExit"
+              if ($enInitCurlExit -ne 0 -or $enInitStatus -ne "200") {
+                throw "Fresh install GET /en/init expected HTTP 200, got status=$enInitStatus curlExit=$enInitCurlExit"
+              }
+              if (-not (Test-Path -LiteralPath $enInitBody) -or (Get-Item -LiteralPath $enInitBody).Length -eq 0) {
+                throw "Fresh install GET /en/init returned an empty response"
+              }
+
+              $localhostStatus = "NO_RESPONSE"
+              $localhostCurlExit = "NO_RESPONSE"
+              try {
+                $localhostStatus = & curl.exe --noproxy "*" -sS -o NUL -w "%{http_code}" --max-time 10 "http://localhost:3000/init"
+                $localhostCurlExit = $LASTEXITCODE
+              } catch {
+                $localhostCurlExit = "EXCEPTION"
+              }
+              Write-Host "PORTABLE_LOCALHOST_INIT_STATUS=$localhostStatus"
+              Write-Host "PORTABLE_LOCALHOST_INIT_CURL_EXIT=$localhostCurlExit"
+
               $rootHeaders = Join-Path $env:RUNNER_TEMP "root.headers.txt"
               $rootBody = Join-Path $env:RUNNER_TEMP "root.body.html"
               Remove-Item -LiteralPath $rootHeaders, $rootBody -Force -ErrorAction SilentlyContinue
