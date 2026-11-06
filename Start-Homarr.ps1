@@ -172,8 +172,23 @@ function Get-VerifiedManagedProcess {
         throw "Refusing to stop PID $processId because process start time is missing."
     }
 
-    $actualStartTime = $process.StartTime.ToUniversalTime().ToString("o")
-    if ($actualStartTime -ne $expectedStartTime) {
+    $expectedDateTime = $null
+    if ($expectedStartTime -is [datetime]) {
+        $expectedDateTime = $expectedStartTime
+    } else {
+        try {
+            $expectedDateTime = [datetime]::Parse(
+                $expectedStartTime.ToString(),
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::RoundTripKind
+            )
+        } catch {
+            throw "Refusing to stop PID $processId because the stored process start time is invalid."
+        }
+    }
+
+    $actualDateTime = $process.StartTime.ToUniversalTime()
+    if ($expectedDateTime.ToUniversalTime().Ticks -ne $actualDateTime.Ticks) {
         throw "Refusing to stop PID $processId because the process start time does not match."
     }
 
